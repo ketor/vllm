@@ -26,10 +26,171 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _dcp_scatter_indexer_logits_kernel(
+    local_ptr,
+    local_row_stride,
+    global_ptr,
+    global_row_stride,
+    seq_lens_local_ptr,  # int32 [num_rows], per-row LOCAL context length
+    N: tl.constexpr,  # dcp_world_size
+    RANK: tl.constexpr,  # dcp_rank
+    S: tl.constexpr,  # cp_kv_cache_interleave_size
+    max_local_cols,  # cdiv(global_width, N)
+    global_width,
+    BLOCK: tl.constexpr,
+):
+    # Scatter this rank's local-order logits to their global positions.
+    # The KV cache is sharded across `N` ranks by an interleaved round-robin at
+    # granularity `S` (mirrors block_table._compute_slot_mapping_kernel). The
+    # L-th local token on rank RANK lives in interleave-block ``L // S`` at
+    # offset ``L % S``, whose global position is
+    #     (L // S) * (N * S) + RANK * S + (L % S).
+    # With S == 1 this reduces to ``L * N + RANK`` (per-token round-robin).
+    row = tl.program_id(0)
+    llen = tl.load(seq_lens_local_ptr + row)
+    for i in range(0, max_local_cols, BLOCK):
+        L = i + tl.arange(0, BLOCK)
+        valid = L < llen
+        val = tl.load(local_ptr + row * local_row_stride + L, mask=valid, other=0.0)
+        gcol = (L // S) * (N * S) + RANK * S + (L % S)
+        gvalid = valid & (gcol < global_width)
+        tl.store(global_ptr + row * global_row_stride + gcol, val, mask=gvalid)
+
+
+def _dcp_allgather_indexer_logits(
+    local_logits: torch.Tensor,
+    local_seq_lens: torch.Tensor,
+    dcp_world_size: int,
+    dcp_rank: int,
+    cp_interleave_size: int = 1,
+) -> torch.Tensor:
+    """Reconstruct full-sequence indexer logits from per-rank shards under DCP.
+
+    Each rank computed ``local_logits`` over the KV tokens it physically holds
+    (local order). We scatter them back to their global sequence positions into
+    a zero-filled buffer (same shape/layout as the kernel output, so the
+    downstream top-k kernels see the exact layout they expect) and SUM-reduce
+    across the DCP group. Every global position is owned by exactly one rank
+    (the round-robin partition), so the other ranks contribute 0 and the sum
+    equals that rank's real logit; positions beyond the sequence are 0 on every
+    rank and are masked out by the global seq_lens in the top-k. The reduce uses
+    the DCP group coordinator (not a raw torch.distributed call) so it is issued
+    on vLLM's collective stream and stays compatible with CUDA graph capture.
+    """
+    from vllm.distributed import get_dcp_group
+
+    num_rows, width = local_logits.shape
+    global_logits = torch.zeros_like(local_logits)
+    seq_lens_local_flat = local_seq_lens.reshape(-1).to(torch.int32).contiguous()
+    max_local_cols = (width + dcp_world_size - 1) // dcp_world_size
+    _dcp_scatter_indexer_logits_kernel[(num_rows,)](
+        local_logits,
+        local_logits.stride(0),
+        global_logits,
+        global_logits.stride(0),
+        seq_lens_local_flat,
+        dcp_world_size,
+        dcp_rank,
+        cp_interleave_size,
+        max_local_cols,
+        width,
+        BLOCK=1024,
+    )
+    return get_dcp_group().all_reduce(global_logits)
+
+
+def _dcp_reconstruct_full_indexer_k(
+    kv_cache: torch.Tensor,
+    chunk,
+    values_width: int,
+    values_dtype: torch.dtype,
+    scales_width: int,
+    scales_dtype: torch.dtype,
+    device: torch.device,
+    cp_interleave_size: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reconstruct the full prefill context index-K from per-rank DCP shards.
+
+    Mirrors the dense MLA prefill path
+    (mla_attention._context_parallel_compute_prefill_context): each rank gathers
+    its LOCAL index-K (padded so every rank gathers the same number of tokens),
+    we all-gather across the DCP group, then reorg the shards back into global
+    token order. The KV cache is sharded by an interleaved round-robin at
+    granularity ``S = cp_kv_cache_interleave_size``: global position ``p`` is held
+    by rank ``(p // S) % n`` at local index ``(p // (n*S)) * S + (p % S)``. The
+    reorg therefore regroups the all-gathered shards ``[n, padded_len, W]`` into
+    ``[padded_len//S, n, S, W]`` (interleave-block major) before flattening to
+    global order. With S == 1 this is the original transpose-reshape
+    (rank-major -> per-token round-robin). Returns (k_quant, k_scale) over the
+    full context, in the same layout cp_gather_indexer_k_quant_cache produces
+    without DCP.
+    """
+    from vllm.distributed import get_dcp_group
+
+    n = chunk.dcp_world_size
+    s = cp_interleave_size
+    sum_padded = int(chunk.local_cu_seq_lens[-1].item())
+    local_k = torch.empty((sum_padded, values_width), dtype=values_dtype, device=device)
+    local_scale = torch.empty(
+        (sum_padded, scales_width), dtype=scales_dtype, device=device
+    )
+    # Local gather: padded local cu_seq_lens -> this rank's compact local tokens
+    # (plus a little block padding) for each request.
+    ops.cp_gather_indexer_k_quant_cache(
+        kv_cache, local_k, local_scale, chunk.block_table, chunk.local_cu_seq_lens
+    )
+    # All-gather across the DCP group (rank-major concatenation along dim 0).
+    ag_k = (
+        get_dcp_group()
+        .all_gather(local_k.view(torch.uint8), dim=0)
+        .view(values_dtype)
+        .view(n, sum_padded, values_width)
+    )
+    ag_scale = (
+        get_dcp_group()
+        .all_gather(local_scale, dim=0)
+        .view(n, sum_padded, scales_width)
+    )
+    # Reorg per request back into global token order, trimmed to ctx.
+    #   S == 1: [n, P, W] -> transpose -> [P, n, W] -> [P*n, W]  (per-token RR)
+    #   S  > 1: [n, P, W] -> [n, P//S, S, W] -> [P//S, n, S, W] -> [P*n, W]
+    # The interleave-block-major regroup makes global position
+    #   (P//S-block) * (n*S) + rank*S + (offset in S) land contiguously.
+    def _reorg(ag, width, padded_len, ctx_len):
+        seg = ag[:, offset : offset + padded_len, :]
+        if s == 1:
+            return seg.transpose(0, 1).reshape(padded_len * n, width)[:ctx_len]
+        assert padded_len % s == 0, (
+            f"padded local seq len {padded_len} must be a multiple of "
+            f"cp_kv_cache_interleave_size {s}"
+        )
+        return (
+            seg.reshape(n, padded_len // s, s, width)
+            .permute(1, 0, 2, 3)
+            .reshape(padded_len * n, width)[:ctx_len]
+        )
+
+    k_segments = []
+    s_segments = []
+    offset = 0
+    for padded_len, ctx_len in zip(
+        chunk.padded_local_seq_lens, chunk.global_seq_lens_lst
+    ):
+        k_segments.append(_reorg(ag_k, values_width, padded_len, ctx_len))
+        s_segments.append(_reorg(ag_scale, scales_width, padded_len, ctx_len))
+        offset += padded_len
+    k_full = torch.cat(k_segments, dim=0)
+    s_full = torch.cat(s_segments, dim=0)
+    return k_full, s_full
+
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
@@ -190,17 +351,35 @@ def sparse_attn_indexer(
             scales_spec,
         )
         for chunk in prefill_metadata.chunks:
-            k_quant = k_quant_full[: chunk.total_seq_lens]
-            k_scale = k_scale_full[: chunk.total_seq_lens]
-
             if not chunk.skip_kv_gather:
-                ops.cp_gather_indexer_k_quant_cache(
-                    kv_cache,
-                    k_quant,
-                    k_scale,
-                    chunk.block_table,
-                    chunk.cu_seq_lens,
-                )
+                if chunk.dcp_world_size > 1:
+                    # DCP: the index-K is sharded across ranks; gather each
+                    # rank's local shard, all-gather, and reorg back into global
+                    # token order so the logits below see the FULL context.
+                    assert not use_fp4_cache, (
+                        "DCP sparse indexer prefill does not support fp4 cache yet"
+                    )
+                    k_quant, k_scale = _dcp_reconstruct_full_indexer_k(
+                        kv_cache,
+                        chunk,
+                        values_width=values_spec[0][1],
+                        values_dtype=values_spec[1],
+                        scales_width=scales_spec[0][1],
+                        scales_dtype=scales_spec[1],
+                        device=hidden_states.device,
+                        cp_interleave_size=chunk.cp_interleave_size,
+                    )
+                else:
+                    k_quant = k_quant_full[: chunk.total_seq_lens]
+                    k_scale = k_scale_full[: chunk.total_seq_lens]
+                    ops.cp_gather_indexer_k_quant_cache(
+                        kv_cache,
+                        k_quant,
+                        k_scale,
+                        chunk.block_table,
+                        chunk.cu_seq_lens,
+                    )
+            # else: reuse k_quant / k_scale from the previous (gathered) chunk.
 
             q_slice = q_quant[chunk.token_start : chunk.token_end]
             q_scale_slice = (
@@ -331,6 +510,26 @@ def sparse_attn_indexer(
                 max_model_len=max_model_len,
                 clean_logits=False,
             )
+        # Under DCP the kernel above read only this rank's KV shard (with local
+        # seq_lens), producing per-rank logits in local order. Scatter them back
+        # to global positions and all-reduce(MAX) so every rank has the full
+        # logits and selects an identical GLOBAL top-k. Top-k then runs over the
+        # reconstructed logits with the GLOBAL seq_lens; the resulting global
+        # logical positions are remapped to this rank's local cache slots by the
+        # sparse attention kernel (triton_convert_req_index_to_global_index).
+        if decode_metadata.dcp_world_size > 1:
+            assert decode_metadata.global_seq_lens is not None
+            topk_seq_lens = decode_metadata.global_seq_lens[:batch_size]
+            logits = _dcp_allgather_indexer_logits(
+                logits,
+                seq_lens,
+                decode_metadata.dcp_world_size,
+                decode_metadata.dcp_rank,
+                decode_metadata.cp_interleave_size,
+            )
+        else:
+            topk_seq_lens = seq_lens
+
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
@@ -341,7 +540,7 @@ def sparse_attn_indexer(
             )
             torch.ops._C.persistent_topk(
                 logits,
-                seq_lens,
+                topk_seq_lens,
                 topk_indices,
                 topk_workspace,
                 topk_tokens,
@@ -351,7 +550,7 @@ def sparse_attn_indexer(
             ops.top_k_per_row_decode(
                 logits,
                 next_n,
-                seq_lens,
+                topk_seq_lens,
                 topk_indices,
                 num_rows,
                 logits.stride(0),

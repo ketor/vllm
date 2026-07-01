@@ -23,6 +23,12 @@ def _convert_req_index_to_global_index_kernel(
     BLOCK_N: tl.constexpr,  # tile width along columns
     HAS_PREFILL: tl.constexpr,
     COUNT_VALID: tl.constexpr,  # whether to count valid indices
+    # DCP (Decode Context Parallel) params. When DCP_WORLD_SIZE == 1 the math
+    # below reduces exactly to the non-DCP formula (block_id = tok // BLOCK_SIZE,
+    # inblock_off = tok % BLOCK_SIZE), so the non-DCP path is unchanged.
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    DCP_INTERLEAVE_SIZE: tl.constexpr,
     # strides (in elements)
     bt_stride0,
     bt_stride1,
@@ -52,9 +58,28 @@ def _convert_req_index_to_global_index_kernel(
     if HAS_PREFILL:
         prefill_req_id = tl.load(prefill_request_id_ptr + token_id)
         is_prefill = prefill_req_id >= 0
-    # Compute block id and in-block offset
-    block_id = tok // BLOCK_SIZE
-    inblock_off = tok % BLOCK_SIZE
+    # Compute block id and in-block offset.
+    # Under DCP the KV cache is sharded across `DCP_WORLD_SIZE` ranks by an
+    # interleaved round-robin (granularity `DCP_INTERLEAVE_SIZE`). `tok` is a
+    # GLOBAL logical position; only the subset of top-k tokens physically held
+    # by this rank can be attended here. We mirror the slot-mapping kernel
+    # (vllm/v1/worker/block_table.py:_compute_slot_mapping_kernel) so the slot
+    # we read matches the slot the token was written to, and mark the tokens
+    # owned by other ranks invalid (-1, skipped by the FlashMLA kernel). The
+    # cross-rank LSE combine in MLAAttention.forward_impl then merges the
+    # per-rank partial attentions back into the full softmax.
+    if DCP_WORLD_SIZE > 1:
+        virtual_block_size = BLOCK_SIZE * DCP_WORLD_SIZE
+        block_id = tok // virtual_block_size
+        voff = tok - block_id * virtual_block_size
+        owner_rank = (voff // DCP_INTERLEAVE_SIZE) % DCP_WORLD_SIZE
+        is_invalid_tok |= owner_rank != DCP_RANK
+        inblock_off = (
+            voff // (DCP_WORLD_SIZE * DCP_INTERLEAVE_SIZE)
+        ) * DCP_INTERLEAVE_SIZE + (voff % DCP_INTERLEAVE_SIZE)
+    else:
+        block_id = tok // BLOCK_SIZE
+        inblock_off = tok % BLOCK_SIZE
 
     # Guard block_table access
     valid_block = (block_id < max_num_blocks_per_req) & (block_id >= 0)
@@ -93,6 +118,9 @@ def triton_convert_req_index_to_global_index(
     prefill_workspace_request_ids: torch.Tensor | None = None,
     prefill_workspace_starts: torch.Tensor | None = None,
     return_valid_counts: bool = False,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
+    dcp_interleave_size: int = 1,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     out[token_id, indice_id] =
@@ -176,6 +204,9 @@ def triton_convert_req_index_to_global_index(
         BLOCK_N,
         HAS_PREFILL_WORKSPACE,
         return_valid_counts,
+        dcp_world_size,
+        dcp_rank,
+        dcp_interleave_size,
         # strides
         bt_stride0,
         bt_stride1,
