@@ -16,7 +16,7 @@ approach for "prefill" (i.e. the ratio Sq / Skv is relatively large, often near
 1) and the data-movement friendly approach for "decode" (i.e. the ratio
 Sq / Skv is small, often near 0).
 
-NOTE what we deem small and large is currently determined by if it is labelled
+NOTE what we deem small and large is currently determined by if its labelled
 prefill or decode by the scheduler, but this is something we should probably
 tune.
 
@@ -96,7 +96,7 @@ NOTE: in the actual code,
 Runtime
 q_c      = h_t @ W_DQ
 q_nope   = (q_c @ W_UQ).view(-1, N, P)
-ql_nope  = einsum("snh,lnh->snl", q_nope, W_UK)
+ql_nope  = einsum("snh,lnh->snl", q, W_UK)
 q_pe     = RoPE(q_c @ W_QR).view(Sq, N, R)
 new_kv_c = h_t @ W_DKV
 new_k_pe = RoPE(h_t @ W_KR)
@@ -1110,6 +1110,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if not should_load_quant_weights(quant_method):
             set_default_quant_scales(self, register_buffer=False)
 
+        # TurboQuant MSE: fold Hadamard Pi into W_UK_T / W_UV before the first
+        # decode bmm so we never need runtime q/o @ Pi in forward_mqa.
+        fold_pi_at_load = getattr(self.impl, "fold_pi_at_load", None)
+        if fold_pi_at_load is not None:
+            fold_pi_at_load(self)
+
     def calc_kv_scales(
         self, q: torch.Tensor, kv_c_normed: torch.Tensor, k_pe: torch.Tensor
     ) -> None:
@@ -1138,6 +1144,30 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        # TurboQuant MLA: cache is packed bytes per slot, not bf16 elements.
+        if self.kv_cache_dtype.startswith("turboquant_"):
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TurboQuantConfig,
+            )
+            from vllm.v1.attention.ops.tq_mla_defaults import resolve_kpe_layout
+
+            tq_cfg = TurboQuantConfig.from_cache_dtype(
+                self.kv_cache_dtype, head_dim=self.kv_lora_rank
+            )
+            kv_c_bytes = tq_cfg.key_packed_size
+            _kpe_4bit, _kpe_fp8, k_pe_bytes = resolve_kpe_layout(
+                self.kv_cache_dtype,
+                tq_cfg,
+                self.qk_rope_head_dim,
+            )
+            packed_bytes = kv_c_bytes + k_pe_bytes
+            return MLAAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=1,
+                head_size=packed_bytes,
+                dtype=torch.uint8,
+                cache_dtype_str=self.kv_cache_dtype,
+            )
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
